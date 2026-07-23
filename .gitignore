@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets & local config — never committed, never auto-written by the agent
+config/api_keys.json
+
+# Runtime state of the self-improvement layer
+# (pending_changes/*.json IS tracked — CI reads approval records from it)
+logs/
+pending_changes/*.patch
+pending_changes/.apply-*
+memory/module_status.json
+memory/self_improve_state.json
+memory/long_term.json
