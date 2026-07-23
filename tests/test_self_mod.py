@@ -235,6 +235,36 @@ def test_review_gate_core_safety_applies_on_dedicated_branch(tmp_path, monkeypat
     assert "hash=" in approval[-1]["diff_summary"]
 
 
+def test_ci_gate_bootstrap_vs_enforcement(tmp_path, monkeypatch):
+    """The CI gate passes only while the base ref lacks the gate itself."""
+    import importlib.util
+    from pathlib import Path as _P
+    gate_src = _P(__file__).resolve().parent.parent / "scripts" / "check_protected_paths.py"
+    spec = importlib.util.spec_from_file_location("gate_under_test", gate_src)
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+
+    repo = _scratch_repo(tmp_path, monkeypatch, {"core/prompt.txt": "persona\n"})
+    monkeypatch.setattr(gate, "BASE_DIR", repo)
+
+    # Bootstrap: HEAD has no gate script -> staged protected change passes
+    (repo / "core/prompt.txt").write_text("persona\nedited\n", encoding="utf-8")
+    subprocess.run(["git", "add", "core/prompt.txt"], cwd=repo, check=True)
+    monkeypatch.setattr("sys.argv", ["check_protected_paths.py"])
+    assert gate.main() == 0
+
+    # Enforcement: commit the gate into HEAD -> same staged change is refused
+    subprocess.run(["git", "commit", "-qm", "edit"], cwd=repo, check=True)
+    gate_copy = repo / "scripts" / "check_protected_paths.py"
+    gate_copy.parent.mkdir(parents=True, exist_ok=True)
+    gate_copy.write_text(gate_src.read_text(encoding="utf-8"), encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "add gate"], cwd=repo, check=True)
+    (repo / "core/prompt.txt").write_text("persona\nedited again\n", encoding="utf-8")
+    subprocess.run(["git", "add", "core/prompt.txt"], cwd=repo, check=True)
+    assert gate.main() == 1
+
+
 def test_review_gate_reject_is_logged(tmp_path, monkeypatch):
     from core import review_gate
     _scratch_repo(tmp_path, monkeypatch, {"actions/x.py": "x = 1\n"})

@@ -42,6 +42,25 @@ def _changed_files(diff_range: str | None) -> list[str]:
     return [l.strip() for l in r.stdout.splitlines() if l.strip()]
 
 
+def _base_ref(diff_range: str | None) -> str:
+    return diff_range.split("..")[0] if diff_range else "HEAD"
+
+
+def _gate_exists_on_base(diff_range: str | None) -> bool:
+    """True if the base ref already contains this gate script.
+
+    Bootstrap case: the PR that INTRODUCES the protection regime cannot be
+    validated against it — the base has nothing to protect yet. Once merged,
+    the base contains the gate and every later touch of a protected file is
+    refused without a human core-safety approval.
+    """
+    r = subprocess.run(
+        ["git", "cat-file", "-e", f"{_base_ref(diff_range)}:scripts/check_protected_paths.py"],
+        cwd=str(BASE_DIR), capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
 def _has_core_safety_approval() -> bool:
     """True if any applied/approved core-safety record exists in pending_changes/."""
     pending = BASE_DIR / "pending_changes"
@@ -67,6 +86,14 @@ def main() -> int:
     ]
     if not touched:
         print("protected-paths: OK (no protected files touched)")
+        return 0
+
+    if not _gate_exists_on_base(diff_range):
+        print("protected-paths: BOOTSTRAP — the base ref does not contain this "
+              "gate yet, so this diff is the one introducing the protection "
+              "regime. Passing; full enforcement starts once it is merged.")
+        for f in touched:
+            print(f"  - {f}")
         return 0
 
     if _has_core_safety_approval():
