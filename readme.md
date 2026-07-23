@@ -48,6 +48,7 @@ It's not just an assistant — it's an extension of your digital life.
 | ⚡ Auto-Start on Boot | Registers with the OS startup system (registry / LaunchAgent / .desktop) |
 | 📋 Clipboard Intelligence | Copy any text → floating panel with Translate / Summarise / Explain / Fix |
 | 🎨 Assistant Customization | Change the assistant name and your name from the UI — takes effect immediately |
+| 🛠️ SELF_IMPROVE Mode | JARVIS reads, analyzes, and safely improves its own code within audited, human-gated boundaries |
 
 ---
 
@@ -80,6 +81,17 @@ When you ask JARVIS to look at your screen or camera, it no longer goes silent w
 ### 📰 Parallel News Search — First Result Wins
 News queries now run Gemini Grounded Search and DuckDuckGo news simultaneously in two threads. Whichever delivers a valid result first is used; the other is silently discarded. A Gemini 503 error no longer delays results — the DDG fallback is already running in parallel.
 
+### 🛠️ SELF_IMPROVE Mode — JARVIS Can Improve Its Own Code
+JARVIS can read, analyze, and modify its own codebase inside strict, auditable boundaries — never silently, never unbounded:
+- **Risk-classified diffs**: every proposed change is labeled `safe`, `dangerous`, or `core_safety_change`. SAFE changes (prompts, helpers, logging, docs, tests) apply automatically on a dedicated git branch with tests before/after and automatic rollback on regression. DANGEROUS changes (system actions, file operations, credentials, dependencies) always wait for your explicit approval — no timeout-approve, ever.
+- **Meta-rule**: any change touching the safety mechanism itself (`core/self_mod.py`, `core/review_gate.py`, `core/prompt.txt`, `config/api_keys.json`, the review tooling) is unconditionally `core_safety_change` — the agent can never widen its own permissions or lower its own safety bar, enforced independently by the code, the review gate, and CI.
+- **Two human review surfaces**: a terminal CLI (`scripts/review_changes.py`) and a HUD dialog (⛨ **REVIEW CHANGES** in the ⚙ drawer). Core-safety changes get a separate red confirmation screen — scroll-to-the-end, a time delay, and a second explicit confirmation — before they can be applied, and only on their own dedicated branch.
+- **RED/YELLOW/GREEN module health**, computed from real call/error rates, drives what SELF_IMPROVE looks at next. New actions it registers are born YELLOW and must earn GREEN.
+- **Bounded runs**: max 10 iterations, max 5 auto-modified files, a 600-second budget, and a stagnation stop — if a module doesn't improve after 3 attempts, JARVIS reports it instead of retrying forever.
+- Every change, approval, rejection, and status transition is written to a JSON-lines audit log.
+
+See [`docs/SELF_IMPROVE.md`](docs/SELF_IMPROVE.md) for the full design.
+
 ---
 
 ## 🗺️ Mark Roadmap
@@ -95,14 +107,55 @@ News queries now run Gemini Grounded Search and DuckDuckGo news simultaneously i
 
 ## ⚡ Quick Start
 
+This fork includes the **SELF_IMPROVE** layer on top of upstream Mark L. Until it's merged into `main`, check out its branch after cloning:
+
 ```bash
-git clone https://github.com/FatihMakes/Mark-L.git
+git clone https://github.com/klcenka9/Mark-L.git
 cd Mark-L
-pip install -r requirements.txt
+git checkout claude/jarvis-self-improve-layer-x71loc
+python setup.py
 python main.py
 ```
 
+`setup.py` installs everything from `requirements.txt`, installs the Playwright browsers, and checks `pywin32` on Windows. To do it by hand instead:
+
+```bash
+pip install -r requirements.txt
+python -m playwright install
+python main.py
+```
+
+On first launch you'll be asked for your Gemini API key, assistant name, and your name — saved to `config/api_keys.json`.
+
 > ⚠️ **Installation Note:** Some OS-specific dependencies are not bundled in `requirements.txt` to keep the repo lightweight. If you hit a `ModuleNotFoundError`, install the missing package with `pip install <module_name>`.
+
+### 🪟 Windows — step by step
+
+1. Install **[Python 3.11 or 3.12](https://python.org/downloads/)** — check **"Add Python to PATH"** during setup.
+2. Install **[Git for Windows](https://git-scm.com/download/win)** — the SELF_IMPROVE layer applies its own changes as git commits/branches, so Git is required, not optional.
+3. Get a free **[Gemini API key](https://aistudio.google.com/apikey)**.
+4. Open PowerShell:
+   ```powershell
+   git clone https://github.com/klcenka9/Mark-L.git
+   cd Mark-L
+   git checkout claude/jarvis-self-improve-layer-x71loc
+   python -m venv venv
+   venv\Scripts\activate
+   python setup.py
+   python main.py
+   ```
+5. Allow microphone access for Python in **Settings → Privacy & security → Microphone** if prompted.
+6. Optional: open the ⚙ drawer in the HUD → **AUTO-START** to launch JARVIS with Windows.
+
+**Common issues:**
+
+| Problem | Fix |
+| --- | --- |
+| `ModuleNotFoundError` | `pip install <missing_module>` |
+| No microphone input | Windows Settings → Privacy → Microphone → allow desktop apps |
+| `pywin32` broken | `pip install --force-reinstall pywin32` then run `Scripts\pywin32_postinstall.py -install` from the venv |
+| PyQt6 window doesn't open | Use 64-bit Python and up-to-date graphics drivers |
+| Playwright browser missing | `python -m playwright install` |
 
 ---
 
@@ -112,8 +165,10 @@ python main.py
 | --- | --- |
 | **OS** | Windows 10/11, macOS, or Linux |
 | **Python** | 3.11 or 3.12 |
+| **Git** | Required — SELF_IMPROVE applies changes as git branches/commits |
 | **Microphone** | Required for voice interaction |
 | **API Key** | Free Gemini API key (`config/api_keys.json`) |
+| **pytest** (optional) | `pip install pytest` to run `tests/` — self-modification safety tests |
 
 ---
 
@@ -123,6 +178,7 @@ python main.py
 Mark L/
 ├── main.py                   # Core loop — Gemini Live session, audio I/O, tool dispatch
 ├── ui.py                     # PyQt6 HUD — waveform, log panel, interrupt button, camera feed
+├── ui_review.py              # HUD dialogs for SELF_IMPROVE approvals (dangerous + core-safety)
 ├── setup.py                  # First-run configuration wizard
 ├── actions/
 │   ├── web_search.py         # Gemini + DDG parallel search (news, research, price, compare)
@@ -144,12 +200,23 @@ Mark L/
 │   ├── game_updater.py       # Game update management (Steam / Epic)
 │   ├── code_helper.py        # Code review and generation
 │   ├── dev_agent.py          # Developer task agent
-│   └── desktop.py            # Desktop and taskbar control
+│   ├── desktop.py            # Desktop and taskbar control
+│   ├── self_improve.py       # SELF_IMPROVE mode — bounded improvement loop, voice tool
+│   └── registry.py           # Dynamic action registry (new actions born YELLOW)
 ├── memory/
 │   ├── memory_manager.py     # Load/save long_term.json — sessions, monitors, identity
-│   └── long_term.json        # Persistent store: identity, preferences, projects, sessions, monitors
+│   ├── long_term.json        # Persistent store: identity, preferences, projects, sessions, monitors
+│   └── module_status.json    # RED/YELLOW/GREEN health per module (SELF_IMPROVE)
 ├── core/
-│   └── prompt.txt            # Assistant personality and tool-routing rules
+│   ├── prompt.txt            # Assistant personality and tool-routing rules
+│   ├── self_mod.py           # Self-modification engine — classify/apply diffs, status, audit log
+│   └── review_gate.py        # Shared human-approval backend (CLI + HUD)
+├── scripts/
+│   ├── review_changes.py     # Terminal CLI for reviewing pending changes
+│   └── check_protected_paths.py  # CI gate — blocks unapproved core-safety changes
+├── docs/
+│   └── SELF_IMPROVE.md       # Full design of the self-improvement layer
+├── tests/                    # Safety-gate and smoke tests for SELF_IMPROVE
 └── config/
     └── api_keys.json         # API key, OS setting, assistant name, user name
 ```
