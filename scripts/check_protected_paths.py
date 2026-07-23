@@ -24,10 +24,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # core/self_mod.py itself is the file being tampered with.
 PROTECTED_PATHS = (
     "core/self_mod.py",
+    "core/review_gate.py",
     "core/prompt.txt",
     "config/api_keys.json",
     "scripts/review_changes.py",
     "scripts/check_protected_paths.py",
+    "ui_review.py",
     ".github/workflows/protected-paths.yml",
     "tests/test_self_mod.py",
 )

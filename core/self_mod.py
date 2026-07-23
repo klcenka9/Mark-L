@@ -43,10 +43,12 @@ STATUS_PATH       = BASE_DIR / "memory" / "module_status.json"
 # shrink the list through its own pipeline.
 PROTECTED_PATHS = (
     "core/self_mod.py",
+    "core/review_gate.py",
     "core/prompt.txt",
     "config/api_keys.json",
     "scripts/review_changes.py",
     "scripts/check_protected_paths.py",
+    "ui_review.py",
     ".github/workflows/protected-paths.yml",
     "tests/test_self_mod.py",
 )
@@ -76,6 +78,9 @@ DANGEROUS_CONTENT_PATTERNS = (
     r"api[_-]?key", r"\btoken\b", r"\bpassword\b", r"\bsecret\b",
     r"\bdeploy\b", r"\bproduction\b",
     r"\beval\s*\(", r"\bexec\s*\(",
+    # Code that reaches into the safety API is never auto-applied:
+    r"\breview_gate\b", r"\bapprove_and_apply\b", r"\bapprove_dangerous\b",
+    r"\bapply_diff\s*\(", r"\bclassify_change\s*\(", r"\bPROTECTED_PATHS\b",
 )
 
 # Status thresholds — measurable, not subjective.

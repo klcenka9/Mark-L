@@ -2703,6 +2703,14 @@ class MainWindow(QMainWindow):
         cust_btn.clicked.connect(self._open_customize)
         lay.addWidget(cust_btn)
 
+        self._review_btn = QPushButton("⛨  REVIEW CHANGES")
+        self._review_btn.setFixedHeight(26)
+        self._review_btn.setFont(QFont("Courier New", 7))
+        self._review_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._review_btn.setStyleSheet(_BTN_STYLE_DIM)
+        self._review_btn.clicked.connect(self._open_review_changes)
+        lay.addWidget(self._review_btn)
+
         self._brief_btn = QPushButton()
         self._brief_btn.setFixedHeight(26)
         self._brief_btn.setFont(QFont("Courier New", 7))
@@ -2715,6 +2723,7 @@ class MainWindow(QMainWindow):
 
     def _toggle_drawer(self, checked: bool):
         if checked:
+            self._refresh_review_btn()
             self._position_quick_drawer()
             self._quick_drawer.show()
             self._quick_drawer.raise_()
@@ -3063,6 +3072,35 @@ class MainWindow(QMainWindow):
                 }}
                 QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
             """)
+
+    # ── Self-improvement review ─────────────────────────────────────────────────
+
+    def _pending_review_count(self) -> int:
+        try:
+            from core import self_mod
+            return sum(1 for r in self_mod.list_pending() if r["status"] == "pending")
+        except Exception:
+            return 0
+
+    def _refresh_review_btn(self):
+        if not hasattr(self, "_review_btn"):
+            return
+        n = self._pending_review_count()
+        self._review_btn.setText(f"⛨  REVIEW CHANGES ({n})" if n else "⛨  REVIEW CHANGES")
+
+    def _open_review_changes(self):
+        try:
+            from ui_review import PendingChangesDialog
+        except Exception as e:
+            self._log.append_log(f"SYS: Review dialog unavailable — {e}")
+            return
+        dlg = PendingChangesDialog(parent=self)
+        dlg.exec()
+        self._refresh_review_btn()
+        n = self._pending_review_count()
+        self._log.append_log(
+            f"SYS: Review closed — {n} change(s) still pending." if n
+            else "SYS: Review closed — no pending changes.")
 
     # ── Customization ────────────────────────────────────────────────────────────
 
