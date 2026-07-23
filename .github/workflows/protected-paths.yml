@@ -1,0 +1,30 @@
+name: protected-paths
+
+# Enforces the core-safety meta-rule in CI: any PR touching PROTECTED_PATHS
+# is rejected unless a human core-safety approval record exists. SAFE and
+# ordinary DANGEROUS changes pass through untouched.
+
+on:
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  protected-paths:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check protected paths
+        run: |
+          python scripts/check_protected_paths.py "origin/${{ github.base_ref }}..HEAD"
+
+      - name: Run smoke tests
+        run: |
+          pip install pytest
+          python -m pytest -q tests/

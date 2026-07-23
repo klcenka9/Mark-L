@@ -57,6 +57,9 @@ from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
 )
 from actions.web_search        import _news as _fetch_news_sync
+from actions.self_improve      import self_improve, maybe_scheduled_run, auto_trigger_check
+from actions                   import registry as action_registry
+from core                      import self_mod
 from memory.config_manager     import get_brief_enabled
 
 
@@ -516,6 +519,28 @@ TOOL_DECLARATIONS = [
     }
 },
     {
+        "name": "self_improve",
+        "description": (
+            "SELF_IMPROVE mode: JARVIS analyzes and improves its own code. "
+            "Use action='status' when the user asks about module health or code quality. "
+            "Use action='run' when the user explicitly asks JARVIS to improve, fix, or "
+            "upgrade itself or one of its modules. "
+            "Use action='pending' when the user asks what changes await approval. "
+            "Use action='audit' for the recent self-modification history. "
+            "SAFE changes are applied automatically; DANGEROUS changes always wait "
+            "for the user's explicit approval and are never applied silently."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":      {"type": "STRING", "description": "run | status | pending | audit"},
+                "target":      {"type": "STRING", "description": "Optional module to focus on, e.g. 'web_search'"},
+                "instruction": {"type": "STRING", "description": "Optional user instruction, e.g. 'add a retry to web search'"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
         "name": "save_memory",
         "description": (
             "Save an important personal fact about the user to long-term memory. "
@@ -548,6 +573,37 @@ TOOL_DECLARATIONS = [
 ]
 
 # --- Plugin system ---
+# Dynamically registered actions (added by SELF_IMPROVE mode) extend the
+# tool list at startup; unknown tool names fall through to the registry.
+try:
+    TOOL_DECLARATIONS += action_registry.load_plugin_declarations()
+except Exception as _e:
+    print(f"[Registry] Plugin declarations unavailable: {_e}")
+
+# Maps tool names to their action module so runtime results feed the
+# RED/YELLOW/GREEN status system (core.self_mod.record_call).
+TOOL_MODULE_MAP = {
+    "open_app":          "actions/open_app.py",
+    "web_search":        "actions/web_search.py",
+    "weather_report":    "actions/weather_report.py",
+    "send_message":      "actions/send_message.py",
+    "reminder":          "actions/reminder.py",
+    "youtube_video":     "actions/youtube_video.py",
+    "screen_process":    "actions/screen_processor.py",
+    "computer_settings": "actions/computer_settings.py",
+    "browser_control":   "actions/browser_control.py",
+    "file_controller":   "actions/file_controller.py",
+    "desktop_control":   "actions/desktop.py",
+    "code_helper":       "actions/code_helper.py",
+    "dev_agent":         "actions/dev_agent.py",
+    "computer_control":  "actions/computer_control.py",
+    "game_updater":      "actions/game_updater.py",
+    "flight_finder":     "actions/flight_finder.py",
+    "system_status":     "actions/system_monitor.py",
+    "file_processor":    "actions/file_processor.py",
+    "manage_monitor":    "actions/background_monitor.py",
+    "self_improve":      "actions/self_improve.py",
+}
 
 
 class JarvisLive:
@@ -871,13 +927,28 @@ class JarvisLive:
                     _os._exit(0)
                 asyncio.create_task(_do_shutdown())
 
+            elif name == "self_improve":
+                r = await loop.run_in_executor(None, lambda: self_improve(parameters=args, player=self.ui, speak=self.speak))
+                result = r or "Done."
+
             else:
-                result = f"Unknown tool: {name}"
+                # Fall through to dynamically registered plugin actions
+                r = await loop.run_in_executor(
+                    None, lambda: action_registry.dispatch(name, parameters=args, player=self.ui)
+                )
+                result = r if r is not None else f"Unknown tool: {name}"
+
+            _mod = TOOL_MODULE_MAP.get(name)
+            if _mod:
+                self_mod.record_call(_mod, ok=True)
 
         except Exception as e:
             result = f"Tool '{name}' failed: {e}"
             traceback.print_exc()
             self.speak_error(name, e)
+            _mod = TOOL_MODULE_MAP.get(name)
+            if _mod:
+                self_mod.record_call(_mod, ok=False, error=str(e))
 
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
@@ -1300,6 +1371,31 @@ class JarvisLive:
                         print(f"[Monitor] ⚠️ Background check error: {e}")
             await asyncio.sleep(1800)     # check every 30 minutes
 
+    async def _run_self_improve_schedule(self) -> None:
+        """Daily SELF_IMPROVE run + RED-module trigger. Results go to the log;
+        the user is only notified when something needs their approval."""
+        await asyncio.sleep(600)          # let the session settle first
+        while True:
+            try:
+                summary = await asyncio.to_thread(maybe_scheduled_run)
+                if summary is None:
+                    summary = await asyncio.to_thread(auto_trigger_check)
+                if summary:
+                    self.ui.write_log(f"SYS: {summary}")
+                    if "Waiting for human review" in summary and self.session:
+                        with self._speaking_lock:
+                            speaking = self._is_speaking
+                        if not speaking:
+                            await self.session.send_client_content(
+                                turns={"parts": [{"text":
+                                    "[SYSTEM_ALERT] A self-improvement change is waiting for "
+                                    "the user's approval. Mention it briefly in one sentence."}]},
+                                turn_complete=True,
+                            )
+            except Exception as e:
+                print(f"[SelfImprove] ⚠️ Scheduled run error: {e}")
+            await asyncio.sleep(3600)     # re-check hourly; run gates itself daily
+
     # ── Proactive mode ──────────────────────────────────────────────────────────
 
     async def _run_proactive_mode(self) -> None:
@@ -1455,6 +1551,7 @@ class JarvisLive:
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
+                    tg.create_task(self._run_self_improve_schedule())
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
 
