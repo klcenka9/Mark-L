@@ -51,6 +51,22 @@ PROTECTED_PATHS = (
     "ui_review.py",
     ".github/workflows/protected-paths.yml",
     "tests/test_self_mod.py",
+    # The orchestrator's own run limits (MAX_ITERATIONS, MAX_AUTO_FILES,
+    # TIME_BUDGET_S, STAGNATION_LIMIT) and the dynamic-skill registration
+    # mechanism ARE the safety mechanism in spirit, even though they live
+    # outside core/. A "safe"-classified diff to any of these could quietly
+    # raise its own limits or weaken its own validation — the exact
+    # self-widening the meta-rule exists to prevent.
+    "actions/self_improve.py",
+    "actions/registry.py",
+    # main.py wires tool dispatch, the self_improve scheduler, and the
+    # record_call() hooks that feed the status system; it also has zero
+    # smoke-test coverage (root-level file, excluded from _import_smoke).
+    "main.py",
+    # The only test that currently pins the run-limit constants and the
+    # registry's name/module validation — must not be weakened alongside
+    # the code it guards.
+    "tests/test_smoke_imports.py",
 )
 
 # ── Risk classification rules ────────────────────────────────────────────────
@@ -237,6 +253,11 @@ def record_call(module: str, ok: bool, error: str = "") -> None:
 
 # ── Classification ───────────────────────────────────────────────────────────
 
+def _is_protected(path: str) -> bool:
+    """True if `path` matches an entry in PROTECTED_PATHS."""
+    return any(fnmatch.fnmatch(path, pat) or path == pat for pat in PROTECTED_PATHS)
+
+
 def classify_change(diff: str) -> str:
     """Classify a diff as 'safe', 'dangerous' or 'core_safety_change'.
 
@@ -248,9 +269,8 @@ def classify_change(diff: str) -> str:
     if not paths:
         raise ValueError("Diff touches no recognizable files.")
 
-    for p in paths:
-        if any(fnmatch.fnmatch(p, pat) or p == pat for pat in PROTECTED_PATHS):
-            return "core_safety_change"
+    if any(_is_protected(p) for p in paths):
+        return "core_safety_change"
 
     for p in paths:
         if any(fnmatch.fnmatch(p, pat) or p == pat for pat in DANGEROUS_PATH_PATTERNS):
@@ -482,11 +502,105 @@ def apply_diff(diff: str, risk_level: str) -> bool:
     return _apply_on_branch(diff, risk_level, approved_by=None)
 
 
+# Progressively more tolerant `git apply` strategies. Model-generated diffs
+# commonly (a) have LF endings that must patch this repo's CRLF files — a CR
+# is trailing whitespace to git, handled by --ignore-whitespace — and
+# (b) carry wrong @@ line counts, which --recount recomputes. The last
+# strategy tolerates both at once. Shared by the SAFE path (below) and the
+# core-safety path (core/review_gate.py) so both get the same tolerance.
+APPLY_STRATEGIES = (
+    ["--whitespace=nowarn"],
+    ["--whitespace=nowarn", "--ignore-whitespace"],
+    ["--whitespace=nowarn", "--recount"],
+    ["--whitespace=nowarn", "--recount", "--ignore-whitespace"],
+)
+
+
+def dirty_tracked_files(base_dir: Path | None = None) -> list[str]:
+    """`git status --porcelain` lines for TRACKED files only (excludes `??`
+    untracked entries). Non-empty means something other than the diff about
+    to be applied is uncommitted — used to refuse an apply that would
+    otherwise sweep unrelated local edits into a self-improve commit."""
+    return [l for l in _git("status", "--porcelain", base_dir=base_dir).stdout.splitlines()
+            if l and not l.startswith("??")]
+
+
+def apply_patch_with_fallback(patch_file: Path, cwd: Path | None = None) -> list[str] | None:
+    """Return the first APPLY_STRATEGIES flag set that applies `patch_file`
+    cleanly (dry-run via --check), or None if none of them do."""
+    for flags in APPLY_STRATEGIES:
+        if _git("apply", "--check", *flags, str(patch_file), base_dir=cwd).returncode == 0:
+            return flags
+    return None
+
+
+def protected_content_hash(paths: list[str], base_dir: Path | None = None) -> str:
+    """Deterministic hash of the CURRENT on-disk content of `paths`.
+
+    Binds a core-safety approval to the exact end-state of the files it
+    covers, not to diff text — so it is immune to how the diff was expressed
+    (whitespace, --recount adjustments, model formatting quirks) and to
+    reuse against any *other* diff, since any different content produces a
+    different hash. Any file not present is hashed as "<deleted>", so a
+    diff that removes a protected file still requires a fresh approval.
+    """
+    base = base_dir or BASE_DIR
+    h = hashlib.sha256()
+    for p in sorted(paths):
+        full = base / p
+        content = full.read_bytes() if full.is_file() else b"<deleted>"
+        h.update(p.encode("utf-8") + b"\0" + content + b"\0")
+    return h.hexdigest()[:16]
+
+
+def make_create_file_diff(path: str, content: str) -> str:
+    """Build a unified diff that creates a brand-new file at `path`."""
+    lines = content.splitlines()
+    body = "\n".join(f"+{l}" for l in lines)
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        f"new file mode 100644\n"
+        f"--- /dev/null\n"
+        f"+++ b/{path}\n"
+        f"@@ -0,0 +1,{len(lines)} @@\n"
+        f"{body}\n"
+    )
+
+
 def _apply_on_branch(diff: str, risk_level: str, approved_by: str | None) -> bool:
-    """git branch -> apply -> commit -> tests; revert and report on regression."""
+    """git branch -> apply -> commit -> tests; revert and report on regression.
+
+    On success, fast-forward-merges the self-improve branch back into the
+    branch this call started on — SAFE changes are pre-vetted (classified
+    safe, tests green, quality check passed), so per spec they "se mohou
+    mergovat automaticky po zelených testech". Without this, the change
+    would exist only on an orphan branch nobody merges: the running app
+    (and any successive self-improve iteration) would never see it on disk,
+    and a newly created action file would vanish the instant the worktree
+    returns to the base branch, defeating "okamžitě zpřístupnit agentovi".
+    The self-improve/* branch itself is kept (not deleted) as a named,
+    revertible audit trail of exactly what changed and when.
+
+    On regression/failure, the worktree simply returns to the branch it
+    started on — nothing is merged, so a bad change never lands anywhere
+    reachable from the base branch.
+    """
     paths  = _diff_paths(diff)
     module = Path(paths[0]).stem if paths else "change"
     branch = f"self-improve/{module}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+    # Uncommitted edits to TRACKED files (e.g. a human mid-edit in the same
+    # checkout while the scheduler runs) could conflict with the branch
+    # switch back to `start` at the end. Untracked files (like a
+    # freshly-queued pending_changes/*.json from a different iteration of
+    # this same run) are harmless — checkout never touches them — so only
+    # tracked modifications block the apply.
+    dirty = dirty_tracked_files(base_dir=BASE_DIR)
+    if dirty:
+        print("[SelfMod] Worktree has uncommitted tracked changes — skipping "
+              f"apply to avoid bundling unrelated local edits into a "
+              f"self-improve commit: {dirty[:3]}")
+        return False
 
     before = run_tests()
     after  = before
@@ -508,22 +622,7 @@ def _apply_on_branch(diff: str, risk_level: str, approved_by: str | None) -> boo
 
     ok = False
     try:
-        # Try strict first, then progressively more tolerant. Model-generated
-        # diffs commonly (a) have LF endings that must patch this repo's CRLF
-        # files — a CR is trailing whitespace to git, handled by
-        # --ignore-whitespace — and (b) carry wrong @@ line counts, which
-        # --recount recomputes. The last strategy tolerates both at once.
-        strategies = (
-            ["--whitespace=nowarn"],
-            ["--whitespace=nowarn", "--ignore-whitespace"],
-            ["--whitespace=nowarn", "--recount"],
-            ["--whitespace=nowarn", "--recount", "--ignore-whitespace"],
-        )
-        flags = next(
-            (f for f in strategies
-             if _git("apply", "--check", *f, str(patch_file)).returncode == 0),
-            None,
-        )
+        flags = apply_patch_with_fallback(patch_file)
         if flags is None:
             check = _git("apply", "--check", "--whitespace=nowarn", str(patch_file))
             print(f"[SelfMod] Patch does not apply: {check.stderr.strip()[:200]}")
@@ -548,6 +647,15 @@ def _apply_on_branch(diff: str, risk_level: str, approved_by: str | None) -> boo
             ok = True
     finally:
         patch_file.unlink(missing_ok=True)
+        _git("checkout", start)
+        if ok:
+            merged = _git("merge", "--ff-only", branch)
+            if merged.returncode != 0:
+                # Base moved on since branch was cut (e.g. a concurrent apply) —
+                # keep the branch for manual/human merge rather than force it.
+                ok = False
+                print(f"[SelfMod] Applied on {branch} but could not fast-forward "
+                      f"{start}: {merged.stderr.strip()[:200]}")
         log_change({
             "module": ", ".join(paths),
             "event": "apply_diff",

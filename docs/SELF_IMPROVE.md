@@ -15,21 +15,39 @@ boundaries. The layer has four parts:
 ## Risk levels
 
 - **safe** — prompts, helpers, logging, docs, tests, refactors without data
-  deletion. Applied automatically: new git branch → `git apply` → commit →
-  tests before/after → automatic `git revert` on regression.
+  deletion, new action/skill files. Applied automatically: new
+  `self-improve/<module>-<timestamp>` branch → `git apply` → commit →
+  tests + a quality gate before/after → on success, **fast-forward-merged
+  back into the branch the run started on** (per spec, SAFE changes "se
+  mohou mergovat automaticky po zelených testech") so the change is on disk
+  immediately, not marooned on an orphan branch nobody merges; on
+  regression or quality failure, `git revert` on the feature branch and
+  nothing is merged. The `self-improve/*` branch itself is kept either way,
+  as a named, independently revertible audit trail.
+  The quality gate catches degradations tests alone would miss — e.g. a
+  diff that is "safe" and test-green but silently drops a module's
+  docstring is treated as a regression and reverted.
 - **dangerous** — user-file manipulation, system actions (power/network),
   credentials, deployment, dependency changes. Never applied silently:
   queued in `pending_changes/<id>.json` with diff + rationale +
   expected_effect + rollback_plan, waits for explicit human approval
   (`python scripts/review_changes.py approve <id>`, typed `yes`).
   No response ≠ approval — there is no timeout-approve.
-- **core_safety_change** — anything touching `PROTECTED_PATHS`
-  (`core/self_mod.py`, `core/review_gate.py`, `core/prompt.txt`,
+- **core_safety_change** — anything touching `PROTECTED_PATHS`:
+  `core/self_mod.py`, `core/review_gate.py`, `core/prompt.txt`,
   `config/api_keys.json`, the review CLI, the CI gate, `ui_review.py`,
-  `tests/test_self_mod.py`). The agent can only *queue* these;
-  `apply_diff()` refuses them unconditionally. Approval requires a separate
-  heavier flow (CLI or HUD, below), and the change is applied on a
-  dedicated `core-safety/*` branch, never mixed with other changes.
+  `tests/test_self_mod.py` — **and, since these are just as much "the
+  safety mechanism" in spirit, also `actions/self_improve.py` (the
+  orchestrator's own run limits), `actions/registry.py` (the dynamic-skill
+  mechanism), `main.py` (tool dispatch + the status-tracking hooks), and
+  `tests/test_smoke_imports.py`** (the one test that pins those limits —
+  otherwise a diff could weaken the guardrail test in the same "safe"
+  commit that raises the limit it guards). The agent can only *queue*
+  these; `apply_diff()` refuses them unconditionally. Approval requires a
+  separate heavier flow (CLI or HUD, below), and the change is applied on
+  its own dedicated `core-safety/*` branch — never fast-forwarded into the
+  base branch automatically, never mixed with other changes; a human
+  merges it deliberately.
 
 ## HUD review (ui_review.py)
 
@@ -64,8 +82,13 @@ The classification is enforced three times independently:
 2. `scripts/review_changes.py` re-classifies before approving;
 3. CI (`.github/workflows/protected-paths.yml` →
    `scripts/check_protected_paths.py`, which keeps its own literal copy of
-   the protected list) refuses any PR touching protected paths without a
-   human core-safety approval record.
+   the protected list) refuses any PR touching protected paths unless an
+   approved/applied core-safety record's `applied_content_hash` matches the
+   **current content** of the touched protected files. The match is
+   content-bound, not "does any approval exist" — a record approved for one
+   change can never be reused to wave through a different, later,
+   unapproved change to the same or other protected files, even long after
+   that record has been merged and sits permanently in `pending_changes/`.
 
 ## Run limits
 
@@ -89,16 +112,34 @@ to `logs/self_improve_audit.jsonl` as one JSON line:
 `{timestamp, module, event, risk_level, applied, approved_by, test_result,
 status_before, status_after, ...}`.
 
+## Adding a new skill (`add_skill`)
+
+`actions/self_improve.add_skill(name, description, code)` closes the loop
+on `actions/registry.py`'s dynamic-action mechanism — creating a new
+`actions/<name>.py` file goes through the exact same pipeline as any other
+change: `classify_change()` decides the risk (a plain new file with no
+dangerous content classifies `safe`), `apply_diff()` applies it (git
+branch, tests, quality check, fast-forward-merge on success), and only
+*after* a successful apply is `registry.register_action()` called to wire
+it into `TOOL_DECLARATIONS`. `code` must define `run(parameters, **kwargs)`.
+The skill is born **YELLOW** like any registry addition — it must earn
+GREEN through error-free calls.
+
 ## Voice commands
 
 - "How healthy are your modules?" → `self_improve(action='status')`
 - "Improve your web search module" → `self_improve(action='run', target='web_search')`
 - "What changes are waiting for me?" → `self_improve(action='pending')`
 - "Show your self-modification history" → `self_improve(action='audit')`
+- "Add a skill that ..." → `self_improve(action='add_skill', name=..., description=..., code=...)`
 
 ## Rollback
 
-Every applied change is a single commit on its own
-`self-improve/<module>-<timestamp>` branch — rollback is always
-`git revert <commit>`. Regressions detected by the post-apply test run are
-reverted automatically.
+Every applied SAFE or DANGEROUS change is a single commit on its own
+`self-improve/<module>-<timestamp>` branch, fast-forward-merged into the
+branch the run started on — rollback is always `git revert <commit>`.
+Regressions or quality-gate failures detected by the post-apply check are
+reverted automatically and never merged. Core-safety changes go on their
+own `core-safety/<hash>-<timestamp>` branch and are never auto-merged; a
+human merges them deliberately (e.g. via a PR, once the protected-paths CI
+gate confirms a matching approval).

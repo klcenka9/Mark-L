@@ -7,12 +7,20 @@ This is the technical enforcement of the meta-rule: even if a core-safety
 diff is mislabeled 'safe' or approved like an ordinary dangerous change,
 this check refuses it until the special approval exists.
 
+The approval match is bound to the CURRENT CONTENT of the touched protected
+files (a hash over path+content pairs, see _protected_content_hash), not to
+"an approval exists somewhere". A record approved for one change can never
+cover a different, later change to the same or other protected files —
+including a change that happens to occur after the approving record has
+long been merged and is sitting permanently in pending_changes/.
+
 Usage:
     python scripts/check_protected_paths.py                # staged changes
     python scripts/check_protected_paths.py <base>..<head> # CI range
 """
 
 import fnmatch
+import hashlib
 import json
 import subprocess
 import sys
@@ -32,6 +40,10 @@ PROTECTED_PATHS = (
     "ui_review.py",
     ".github/workflows/protected-paths.yml",
     "tests/test_self_mod.py",
+    "actions/self_improve.py",
+    "actions/registry.py",
+    "main.py",
+    "tests/test_smoke_imports.py",
 )
 
 
@@ -61,11 +73,27 @@ def _gate_exists_on_base(diff_range: str | None) -> bool:
     return r.returncode == 0
 
 
-def _has_core_safety_approval() -> bool:
-    """True if any applied/approved core-safety record exists in pending_changes/."""
+def _protected_content_hash(paths: list[str]) -> str:
+    """Same algorithm as core.self_mod.protected_content_hash — kept as a
+    literal copy (not imported) so this gate works even if core/self_mod.py
+    is the file being tampered with. Consistency between the two is
+    enforced by tests/test_self_mod.py."""
+    h = hashlib.sha256()
+    for p in sorted(paths):
+        full = BASE_DIR / p
+        content = full.read_bytes() if full.is_file() else b"<deleted>"
+        h.update(p.encode("utf-8") + b"\0" + content + b"\0")
+    return h.hexdigest()[:16]
+
+
+def _has_matching_core_safety_approval(touched: list[str]) -> bool:
+    """True if an approved/applied core-safety record's applied_content_hash
+    matches the CURRENT content of the touched protected paths — i.e., a
+    human approved exactly this end-state, not merely some past change."""
     pending = BASE_DIR / "pending_changes"
     if not pending.is_dir():
         return False
+    current_hash = _protected_content_hash(touched)
     for f in pending.glob("*.json"):
         try:
             rec = json.loads(f.read_text(encoding="utf-8"))
@@ -73,7 +101,8 @@ def _has_core_safety_approval() -> bool:
             continue
         if (rec.get("risk_level") == "core_safety_change"
                 and rec.get("status") in ("approved", "applied")
-                and rec.get("approved_by")):
+                and rec.get("approved_by")
+                and rec.get("applied_content_hash") == current_hash):
             return True
     return False
 
@@ -96,8 +125,9 @@ def main() -> int:
             print(f"  - {f}")
         return 0
 
-    if _has_core_safety_approval():
-        print("protected-paths: protected files touched, core-safety approval found:")
+    if _has_matching_core_safety_approval(touched):
+        print("protected-paths: protected files touched, matching core-safety "
+              "approval found (content-hash bound):")
         for f in touched:
             print(f"  - {f}")
         return 0
