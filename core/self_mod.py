@@ -283,32 +283,77 @@ Problem:
 Relevant code:
 {relevant_code[:8000]}
 
-Return ONLY valid JSON (no markdown fences):
+Return your answer as exactly TWO fenced blocks and nothing else.
+
+First, a metadata block (the diff does NOT go here):
+```json
 {{
-  "diff": "<unified diff with a/ and b/ path prefixes, minimal and focused>",
   "rationale": "why this change",
   "expected_effect": "what should improve",
   "risk_level": "safe | dangerous",
   "rollback_plan": "how to revert (git revert of the created commit)",
   "tests_to_run": ["tests/test_smoke_imports.py"]
 }}
+```
+
+Then the change itself as a unified diff, in its own block:
+```diff
+--- a/path/to/file.py
++++ b/path/to/file.py
+@@ ... @@
+ <context and +/- lines>
+```
 
 Rules:
 - Small, reviewable diff. No refactors beyond the problem.
+- Put the diff ONLY in the ```diff block — never inside the JSON.
 - Never touch: {', '.join(PROTECTED_PATHS)}
 - No irreversible operations (deletes, credential changes)."""
 
     response = model.generate_content(prompt)
-    raw = re.sub(r"^```[a-zA-Z]*\r?\n?|\r?\n?```\s*$", "", response.text.strip())
-    proposal = json.loads(raw)
-
-    for key in ("diff", "rationale", "expected_effect", "rollback_plan"):
-        if key not in proposal:
-            raise ValueError(f"Proposal missing key: {key}")
+    proposal = _parse_proposal(response.text or "")
 
     proposal["model_risk_opinion"] = proposal.get("risk_level")
     proposal["risk_level"] = classify_change(proposal["diff"])   # binding
     proposal.setdefault("tests_to_run", [])
+    return proposal
+
+
+def _extract_fence(text: str, lang: str) -> str | None:
+    """Return the body of the first ```<lang> ... ``` block, or None."""
+    m = re.search(rf"```{lang}\b[^\n]*\r?\n(.*?)\r?\n?```", text, re.DOTALL)
+    return m.group(1) if m else None
+
+
+def _parse_proposal(text: str) -> dict:
+    """Extract a proposal from raw model output.
+
+    Prefers separate ```diff and ```json fenced blocks — robust because the
+    diff (full of quotes and newlines) never has to survive JSON escaping.
+    Falls back to a single JSON object with an embedded diff for models that
+    still answer that way.
+    """
+    diff = _extract_fence(text, "diff")
+    meta = _extract_fence(text, "json")
+
+    proposal: dict = {}
+    if meta:
+        try:
+            proposal = json.loads(meta)
+        except json.JSONDecodeError:
+            proposal = {}
+    if diff is not None:
+        proposal["diff"] = diff
+
+    if not proposal.get("diff"):
+        # Fallback: whole output is one JSON object with the diff inside it.
+        raw = re.sub(r"^```[a-zA-Z]*\r?\n?|\r?\n?```\s*$", "", text.strip())
+        proposal = json.loads(raw)
+
+    for key in ("diff", "rationale", "expected_effect", "rollback_plan"):
+        proposal.setdefault(key, "")
+    if not str(proposal["diff"]).strip():
+        raise ValueError("Model returned no usable diff.")
     return proposal
 
 
@@ -454,26 +499,51 @@ def _apply_on_branch(diff: str, risk_level: str, approved_by: str | None) -> boo
     patch_file.parent.mkdir(parents=True, exist_ok=True)
     patch_file.write_text(diff if diff.endswith("\n") else diff + "\n", encoding="utf-8")
 
+    # Snapshot the pre-change sources for the post-apply quality gate.
+    before_sources = {
+        p: ((BASE_DIR / p).read_text(encoding="utf-8", errors="replace")
+            if (BASE_DIR / p).is_file() else None)
+        for p in paths
+    }
+
     ok = False
     try:
-        check = _git("apply", "--check", "--whitespace=nowarn", str(patch_file))
-        if check.returncode != 0:
+        # Try strict first, then progressively more tolerant. Model-generated
+        # diffs commonly (a) have LF endings that must patch this repo's CRLF
+        # files — a CR is trailing whitespace to git, handled by
+        # --ignore-whitespace — and (b) carry wrong @@ line counts, which
+        # --recount recomputes. The last strategy tolerates both at once.
+        strategies = (
+            ["--whitespace=nowarn"],
+            ["--whitespace=nowarn", "--ignore-whitespace"],
+            ["--whitespace=nowarn", "--recount"],
+            ["--whitespace=nowarn", "--recount", "--ignore-whitespace"],
+        )
+        flags = next(
+            (f for f in strategies
+             if _git("apply", "--check", *f, str(patch_file)).returncode == 0),
+            None,
+        )
+        if flags is None:
+            check = _git("apply", "--check", "--whitespace=nowarn", str(patch_file))
             print(f"[SelfMod] Patch does not apply: {check.stderr.strip()[:200]}")
             _git("checkout", start)
             _git("branch", "-D", branch)
             return False
 
-        _git("apply", "--whitespace=nowarn", str(patch_file))
+        _git("apply", *flags, str(patch_file))
         _git("add", "--", *paths)
         _git("commit", "-m",
              f"self-improve({module}): {risk_level} change {diff_hash(diff)}\n\n"
              f"Applied by SELF_IMPROVE mode. Rollback: git revert this commit.")
 
         after = run_tests()
-        if _is_regression(before, after):
+        q_ok, q_reason = _quality_check(paths, before_sources)
+        if _is_regression(before, after) or not q_ok:
+            reason = "tests regressed" if _is_regression(before, after) else q_reason
             after = before  # reverted — post-state equals pre-state
             _git("revert", "--no-edit", "HEAD")
-            print("[SelfMod] Regression detected — change reverted.")
+            print(f"[SelfMod] Change reverted — {reason}.")
         else:
             ok = True
     finally:
@@ -558,6 +628,37 @@ def _failed_count(result: dict) -> int:
 def _is_regression(before: dict, after: dict) -> bool:
     """A change is a regression if it introduces failures that weren't there."""
     return _failed_count(after) > _failed_count(before)
+
+
+def _quality_check(paths: list[str], before_sources: dict) -> tuple[bool, str]:
+    """Guard the auto-apply SAFE path against silent code degradation.
+
+    Tests alone don't catch a change that is 'safe' and green yet worse — e.g.
+    a model that moves a module docstring below the imports, so the module
+    loses its ``__doc__``. Each changed .py file must still parse and must not
+    drop a module docstring it previously had. Returns ``(ok, reason)``.
+    """
+    import ast
+    for p in paths:
+        if not p.endswith(".py"):
+            continue
+        fp = BASE_DIR / p
+        if not fp.is_file():
+            continue
+        after_src = fp.read_text(encoding="utf-8", errors="replace")
+        try:
+            after_tree = ast.parse(after_src)
+        except SyntaxError as e:
+            return False, f"{p} no longer parses ({e.msg})"
+        before_src = before_sources.get(p)
+        if before_src:
+            try:
+                had_doc = ast.get_docstring(ast.parse(before_src)) is not None
+            except SyntaxError:
+                had_doc = False
+            if had_doc and ast.get_docstring(after_tree) is None:
+                return False, f"{p} lost its module docstring"
+    return True, ""
 
 
 # ── Audit log ────────────────────────────────────────────────────────────────
