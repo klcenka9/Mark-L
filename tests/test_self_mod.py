@@ -35,6 +35,16 @@ def test_protected_paths_are_core_safety():
         assert self_mod.classify_change(_diff_for(path)) == "core_safety_change", path
 
 
+def test_protected_paths_cover_the_orchestrator_surface():
+    """Regression test: a 'safe' diff bumping the loop's own run limits, or
+    weakening registry validation, or touching the tool-dispatch wiring in
+    main.py, must all be core_safety_change — not just core/self_mod.py."""
+    for path in ("actions/self_improve.py", "actions/registry.py",
+                 "main.py", "tests/test_smoke_imports.py"):
+        assert path in self_mod.PROTECTED_PATHS, path
+        assert self_mod.classify_change(_diff_for(path)) == "core_safety_change", path
+
+
 def test_self_mod_is_protected_even_with_harmless_content():
     diff = _diff_for("core/self_mod.py", "# tiny comment improvement")
     assert self_mod.classify_change(diff) == "core_safety_change"
@@ -69,6 +79,40 @@ def test_empty_diff_rejected():
 
 
 # ── apply_diff gate ──────────────────────────────────────────────────────────
+
+def test_apply_refuses_dirty_worktree(tmp_path, monkeypatch):
+    """An uncommitted edit to a tracked file (e.g. a human mid-edit while
+    the scheduler runs) must block the apply rather than risk being swept
+    into the self-improve commit — untracked files are fine and ignored."""
+    import subprocess
+    repo = tmp_path / "repo"
+    (repo / "actions").mkdir(parents=True)
+    (repo / "actions" / "x.py").write_text("a = 1\n", encoding="utf-8")
+    for cmd in (["git", "init", "-q"], ["git", "config", "user.email", "t@t"],
+                ["git", "config", "user.name", "t"], ["git", "add", "-A"],
+                ["git", "commit", "-qm", "init"]):
+        subprocess.run(cmd, cwd=repo, check=True)
+    monkeypatch.setattr(self_mod, "BASE_DIR", repo)
+    monkeypatch.setattr(self_mod, "PENDING_DIR", repo / "pending_changes")
+    monkeypatch.setattr(self_mod, "AUDIT_LOG_PATH", repo / "logs" / "audit.jsonl")
+    monkeypatch.setattr(self_mod, "STATUS_PATH", repo / "status.json")
+    monkeypatch.setattr(self_mod, "run_tests", lambda scope=None: {"passed": True, "runner": "stub"})
+
+    diff = _diff_for("actions/y.py", "y = 1")
+    # Harmless untracked side-effect file — must NOT block the apply.
+    (repo / "pending_changes").mkdir(exist_ok=True)
+    (repo / "pending_changes" / "unrelated.json").write_text("{}")
+    assert self_mod.apply_diff(diff, "safe") is False  # y.py doesn't exist yet as context
+
+    # A genuine uncommitted edit to a TRACKED file — must block.
+    (repo / "actions" / "x.py").write_text("a = 2  # uncommitted human edit\n", encoding="utf-8")
+    diff2 = self_mod.make_create_file_diff("actions/z.py", "z = 1\n")
+    assert self_mod.dirty_tracked_files(base_dir=repo)
+    assert self_mod.apply_diff(diff2, "safe") is False
+    assert not (repo / "actions" / "z.py").exists()
+    # The human's edit survives untouched.
+    assert "uncommitted human edit" in (repo / "actions" / "x.py").read_text()
+
 
 def test_apply_diff_refuses_core_safety(tmp_path, monkeypatch):
     monkeypatch.setattr(self_mod, "AUDIT_LOG_PATH", tmp_path / "audit.jsonl")
@@ -193,6 +237,11 @@ def test_parse_proposal_no_diff_raises():
         self_mod._parse_proposal("```json\n{\"rationale\": \"x\"}\n```")
 
 
+def _git_out(repo, *args) -> str:
+    import subprocess
+    return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True).stdout
+
+
 def test_apply_tolerates_wrong_hunk_counts_and_crlf(tmp_path, monkeypatch):
     """A model diff with wrong @@ counts against a CRLF file still applies
     (via the --recount / --ignore-whitespace fallback strategies)."""
@@ -212,6 +261,8 @@ def test_apply_tolerates_wrong_hunk_counts_and_crlf(tmp_path, monkeypatch):
     monkeypatch.setattr(self_mod, "STATUS_PATH", repo / "status.json")
     monkeypatch.setattr(self_mod, "run_tests", lambda scope=None: {"passed": True, "runner": "stub"})
 
+    start_branch = _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
+
     # LF diff, deliberately wrong count (@@ -1,1 should be -1,2), targeting CRLF file.
     diff = (
         "--- a/actions/x.py\n"
@@ -222,6 +273,20 @@ def test_apply_tolerates_wrong_hunk_counts_and_crlf(tmp_path, monkeypatch):
         " print(1)\n"
     )
     assert self_mod.apply_diff(diff, "safe") is True
+
+    # The change landed on its own self-improve/* branch (kept as a named,
+    # revertible audit trail)...
+    branches = _git_out(repo, "branch", "--list", "self-improve/*").strip()
+    assert branches, "expected a self-improve/* branch to be created"
+    new_branch = branches.lstrip("* ").strip()
+    assert "import sys" in _git_out(repo, "show", f"{new_branch}:actions/x.py")
+
+    # ...AND was fast-forward-merged back into the branch we started from —
+    # per spec, SAFE changes "se mohou mergovat automaticky po zelených
+    # testech" — so the running app and the next self-improve iteration
+    # actually see the change, instead of it being marooned on an orphan
+    # branch nobody merges.
+    assert _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == start_branch
     assert b"import sys" in (repo / "actions" / "x.py").read_bytes()
 
 
@@ -290,6 +355,33 @@ def test_review_gate_refuses_core_safety_via_dangerous_flow(tmp_path, monkeypatc
         review_gate.approve_dangerous(pid, "human")
 
 
+def test_core_safety_approval_resets_to_pending_on_apply_failure(tmp_path, monkeypatch):
+    """A core-safety approval whose patch fails to apply (e.g. base moved on)
+    must not get stuck at status='approved' forever — it resets to
+    'pending' so it still shows up in the review UI/CLI for a retry,
+    instead of silently vanishing from the queue."""
+    from core import review_gate
+    _scratch_repo(tmp_path, monkeypatch, {"core/prompt.txt": "persona\n"})
+    # A diff that can never apply (context line doesn't exist in the file).
+    bad_diff = (
+        "diff --git a/core/prompt.txt b/core/prompt.txt\n"
+        "--- a/core/prompt.txt\n"
+        "+++ b/core/prompt.txt\n"
+        "@@ -1,1 +1,2 @@\n"
+        " this context line does not exist\n"
+        "+new rule\n"
+    )
+    pid = self_mod.queue_pending_change(
+        {"diff": bad_diff, "risk_level": "core_safety_change", "rationale": "x"})
+    msg = review_gate.approve_and_apply_core_safety(pid, "tester")
+    assert "reset to pending" in msg.lower()
+    rec = review_gate.get_pending(pid)
+    assert rec["status"] == "pending"
+    assert rec["approved_by"] is None
+    # Shows up again for review.
+    assert any(r["status"] == "pending" for r in self_mod.list_pending())
+
+
 def test_review_gate_approve_dangerous_applies_on_branch(tmp_path, monkeypatch):
     from core import review_gate
     repo = _scratch_repo(tmp_path, monkeypatch,
@@ -302,16 +394,30 @@ def test_review_gate_approve_dangerous_applies_on_branch(tmp_path, monkeypatch):
         " volume = 1\n"
         "+volume_max = 100\n"
     )
+    start_branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                                  cwd=repo, capture_output=True, text=True).stdout.strip()
     pid = self_mod.queue_pending_change(
         {"diff": diff, "risk_level": "dangerous", "rationale": "add max"})
     msg = review_gate.approve_dangerous(pid, "tester")
     assert "applied" in msg.lower()
-    assert "volume_max" in (repo / "actions/computer_settings.py").read_text()
     rec = review_gate.get_pending(pid)
     assert rec["status"] == "applied" and rec["approved_by"] == "tester"
     branches = subprocess.run(["git", "branch"], cwd=repo,
                               capture_output=True, text=True).stdout
     assert "self-improve/" in branches
+    new_branch = next(b.lstrip("* ").strip() for b in branches.splitlines()
+                      if "self-improve/" in b)
+    shown = subprocess.run(["git", "show", f"{new_branch}:actions/computer_settings.py"],
+                           cwd=repo, capture_output=True, text=True).stdout
+    assert "volume_max" in shown
+    # Worktree is back on the branch it started from (not left on the new
+    # one), and that branch was fast-forwarded to include the change — a
+    # DANGEROUS change applies via the same _apply_on_branch as SAFE, once
+    # a human has approved it.
+    end_branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                                cwd=repo, capture_output=True, text=True).stdout.strip()
+    assert end_branch == start_branch
+    assert "volume_max" in (repo / "actions/computer_settings.py").read_text()
 
 
 def test_review_gate_core_safety_applies_on_dedicated_branch(tmp_path, monkeypatch):
@@ -325,14 +431,35 @@ def test_review_gate_core_safety_applies_on_dedicated_branch(tmp_path, monkeypat
         " persona\n"
         "+new rule\n"
     )
+    start_branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                                  cwd=repo, capture_output=True, text=True).stdout.strip()
     pid = self_mod.queue_pending_change(
         {"diff": diff, "risk_level": "core_safety_change", "rationale": "prompt rule"})
     msg = review_gate.approve_and_apply_core_safety(pid, "tester")
     assert "dedicated core-safety branch" in msg
-    assert "new rule" in (repo / "core/prompt.txt").read_text()
     branches = subprocess.run(["git", "branch"], cwd=repo,
                               capture_output=True, text=True).stdout
     assert "core-safety/" in branches
+    new_branch = next(b.lstrip("* ").strip() for b in branches.splitlines()
+                      if "core-safety/" in b)
+    shown_bytes = subprocess.run(["git", "show", f"{new_branch}:core/prompt.txt"],
+                                 cwd=repo, capture_output=True).stdout
+    assert b"new rule" in shown_bytes
+    # Worktree returns to the branch it started from, unmodified.
+    end_branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                                cwd=repo, capture_output=True, text=True).stdout.strip()
+    assert end_branch == start_branch
+    assert "new rule" not in (repo / "core/prompt.txt").read_text()
+
+    rec = review_gate.get_pending(pid)
+    assert rec["status"] == "applied"
+    # applied_content_hash must match the file's content ON THE NEW BRANCH
+    # (where the change actually landed), not on the worktree's current branch.
+    import hashlib
+    expected = hashlib.sha256(
+        b"core/prompt.txt\0" + shown_bytes + b"\0").hexdigest()[:16]
+    assert rec["applied_content_hash"] == expected
+
     events = self_mod.read_audit_log()
     approval = [e for e in events if e.get("event") == "approval"]
     assert approval and approval[-1]["approved_by"] == "tester"
@@ -367,6 +494,111 @@ def test_ci_gate_bootstrap_vs_enforcement(tmp_path, monkeypatch):
     (repo / "core/prompt.txt").write_text("persona\nedited again\n", encoding="utf-8")
     subprocess.run(["git", "add", "core/prompt.txt"], cwd=repo, check=True)
     assert gate.main() == 1
+
+
+def test_ci_gate_stale_approval_does_not_cover_a_different_change(tmp_path, monkeypatch):
+    """CRITICAL regression test.
+
+    A previously-merged, genuinely-approved core-safety record must NEVER
+    let a later, different, unapproved change to the same protected file
+    through the gate. Before the fix, `_has_core_safety_approval()` only
+    checked "does ANY approved core_safety_change record exist anywhere in
+    pending_changes/" — so once merged, that one record permanently
+    defeated the gate for every future PR. This test reproduces exactly
+    that scenario and asserts it is now refused.
+    """
+    import importlib.util
+    from pathlib import Path as _P
+    gate_src = _P(__file__).resolve().parent.parent / "scripts" / "check_protected_paths.py"
+    spec = importlib.util.spec_from_file_location("gate_under_test2", gate_src)
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+
+    repo = _scratch_repo(tmp_path, monkeypatch, {"core/prompt.txt": "persona\n"})
+    monkeypatch.setattr(gate, "BASE_DIR", repo)
+    monkeypatch.setattr(self_mod, "PENDING_DIR", repo / "pending_changes")
+
+    # Bring the gate itself into HEAD so we're testing "enforcement", not bootstrap.
+    gate_copy = repo / "scripts" / "check_protected_paths.py"
+    gate_copy.parent.mkdir(parents=True, exist_ok=True)
+    gate_copy.write_text(gate_src.read_text(encoding="utf-8"), encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "add gate"], cwd=repo, check=True)
+
+    # A GENUINE, correctly-hash-bound approval for an OLD, already-applied change:
+    # compute the hash of exactly the content that change would leave on disk.
+    old_content = "persona\nold approved rule\n"
+    (repo / "core/prompt.txt").write_text(old_content, encoding="utf-8")
+    old_hash = self_mod.protected_content_hash(["core/prompt.txt"], base_dir=repo)
+
+    (repo / "pending_changes").mkdir(exist_ok=True)
+    stale_rec = {
+        "id": "old-approval", "risk_level": "core_safety_change",
+        "status": "applied", "approved_by": "human",
+        "applied_content_hash": old_hash,
+    }
+    (repo / "pending_changes" / "old-approval.json").write_text(json.dumps(stale_rec))
+
+    monkeypatch.setattr("sys.argv", ["check_protected_paths.py"])
+
+    # Sanity: the stale record DOES cover the matching (old_content) state.
+    subprocess.run(["git", "add", "core/prompt.txt"], cwd=repo, check=True)
+    assert gate.main() == 0, "a hash-matching approval must still pass"
+
+    # Commit that approved change so it's no longer staged.
+    subprocess.run(["git", "commit", "-qm", "apply approved change"], cwd=repo, check=True)
+
+    # Now a DIFFERENT, NEVER-APPROVED change touches the same protected file.
+    # The stale record (for the OLD content) must NOT cover this new content.
+    (repo / "core/prompt.txt").write_text("persona\nold approved rule\nBACKDOOR\n", encoding="utf-8")
+    subprocess.run(["git", "add", "core/prompt.txt"], cwd=repo, check=True)
+    assert gate.main() == 1, (
+        "a stale approval for different content must NOT let a new, "
+        "unapproved change to the same protected file through"
+    )
+
+
+def test_protected_content_hash_matches_between_self_mod_and_ci_gate(tmp_path):
+    """The two independent hash implementations (core/self_mod.py's real
+    one, and the literal copy in scripts/check_protected_paths.py that must
+    keep working even if self_mod.py is compromised) must agree exactly."""
+    import importlib.util
+    gate_src = Path(__file__).resolve().parent.parent / "scripts" / "check_protected_paths.py"
+    spec = importlib.util.spec_from_file_location("gate_under_test3", gate_src)
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+
+    (tmp_path / "core").mkdir()
+    (tmp_path / "core" / "prompt.txt").write_text("persona\nrule\n", encoding="utf-8")
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "api_keys.json").write_text('{"k": "v"}', encoding="utf-8")
+
+    paths = ["core/prompt.txt", "config/api_keys.json", "core/does_not_exist.py"]
+    monkeypatch_base = tmp_path
+    gate.BASE_DIR = monkeypatch_base
+    a = self_mod.protected_content_hash(paths, base_dir=monkeypatch_base)
+    b = gate._protected_content_hash(paths)
+    assert a == b
+
+
+def test_make_create_file_diff_is_appliable(tmp_path, monkeypatch):
+    """A brand-new action file can be created through the normal SAFE apply
+    pipeline (git branch, tests, commit) via a generated create-file diff."""
+    repo = _scratch_repo(tmp_path, monkeypatch, {"actions/__init__.py": ""})
+    monkeypatch.setattr(self_mod, "run_tests", lambda scope=None: {"passed": True, "runner": "stub"})
+
+    code = 'def run(parameters, **kwargs):\n    return "ok"\n'
+    diff = self_mod.make_create_file_diff("actions/demo_new_skill.py", code)
+    assert self_mod.classify_change(diff) == "safe"
+    assert self_mod.apply_diff(diff, "safe") is True
+
+    branches = subprocess.run(["git", "branch"], cwd=repo,
+                              capture_output=True, text=True).stdout
+    new_branch = next(b.lstrip("* ").strip() for b in branches.splitlines()
+                      if "self-improve/" in b)
+    shown = subprocess.run(["git", "show", f"{new_branch}:actions/demo_new_skill.py"],
+                           cwd=repo, capture_output=True, text=True).stdout
+    assert "def run(parameters" in shown
 
 
 def test_review_gate_reject_is_logged(tmp_path, monkeypatch):

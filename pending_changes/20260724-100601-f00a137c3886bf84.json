@@ -1,0 +1,19 @@
+{
+  "id": "20260724-100601-f00a137c3886bf84",
+  "created": "2026-07-24T10:06:01+00:00",
+  "approved_at": "2026-07-24T10:06:01+00:00",
+  "diff_hash": "f00a137c3886bf84",
+  "risk_level": "core_safety_change",
+  "rationale": "Fix critical self-improve safety gaps: content-hash-bound CI approval matching, expanded protected paths covering the orchestrator/registry/main.py surface, branch-reset + fast-forward-merge-back, scoped git add, dirty-worktree guard, stuck-approval retry, and add_skill wiring.",
+  "expected_effect": "The protected-paths gate can no longer be bypassed by a stale approval; the run-limit and registry surface is now covered by the meta-rule.",
+  "rollback_plan": "git revert the merge commit of PR #5.",
+  "tests_to_run": [
+    "tests/test_self_mod.py",
+    "tests/test_smoke_imports.py"
+  ],
+  "status": "approved",
+  "approved_by": "b.2311319filip@gmail.com",
+  "approval_channel": "explicit human approval (AskUserQuestion), recorded by agent",
+  "applied_content_hash": "f00a137c3886bf84",
+  "rejected_reason": null
+}

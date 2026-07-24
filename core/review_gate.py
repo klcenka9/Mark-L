@@ -13,7 +13,6 @@ modify it, and diffs that merely *call* into it classify as dangerous
 """
 
 import json
-import subprocess
 from datetime import datetime, timezone
 
 from core import self_mod
@@ -110,41 +109,71 @@ def approve_and_apply_core_safety(pending_id: str, approved_by: str) -> str:
     })
 
     applied = _apply_on_core_safety_branch(rec)
-    rec.update(status="applied" if applied else "approved",
-               applied_at=_now() if applied else None)
+    if applied:
+        rec.update(status="applied", applied_at=_now())
+    else:
+        # Reset to 'pending' (not stuck on 'approved') so the record still
+        # shows up in the review UI/CLI for a retry after the patch conflict
+        # is resolved, instead of silently disappearing from the queue.
+        rec.update(status="pending", approved_by=None, approved_at=None)
     _save(rec)
     return ("Applied on a dedicated core-safety branch." if applied
-            else "Approved, but the patch did not apply cleanly — resolve manually.")
+            else "Patch did not apply cleanly — reset to pending for a retry.")
 
 
 def _apply_on_core_safety_branch(rec: dict) -> bool:
-    """Apply an approved core-safety diff on its own branch, never mixed."""
+    """Apply an approved core-safety diff on its own branch, never mixed.
+
+    Mutates `rec` in place with `applied_content_hash` — the hash of the
+    exact post-apply content of the protected paths this diff touches. CI's
+    protected-paths gate binds approval to this hash, not to "any approval
+    exists", so a stale or unrelated approval record can never cover a
+    different change. Always returns the worktree to the branch it started
+    on, whether the apply succeeds or fails.
+    """
     base   = self_mod.BASE_DIR
     branch = f"core-safety/{rec['diff_hash']}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     patch  = self_mod.PENDING_DIR / f".core-safety-{rec['diff_hash']}.patch"
     diff   = rec["diff"]
+
+    if self_mod.dirty_tracked_files(base_dir=base):
+        print("[ReviewGate] Worktree has uncommitted tracked changes — "
+              "refusing to apply to avoid bundling unrelated local edits.")
+        return False
+
     patch.parent.mkdir(parents=True, exist_ok=True)
     patch.write_text(diff if diff.endswith("\n") else diff + "\n", encoding="utf-8")
+
+    start = self_mod._git("rev-parse", "--abbrev-ref", "HEAD", base_dir=base).stdout.strip()
     try:
-        def git(*a):
-            return subprocess.run(["git", *a], cwd=str(base),
-                                  capture_output=True, text=True)
-        if git("apply", "--check", "--whitespace=nowarn", str(patch)).returncode != 0:
+        flags = self_mod.apply_patch_with_fallback(patch, cwd=base)
+        if flags is None:
             return False
-        git("checkout", "-b", branch)
-        git("apply", "--whitespace=nowarn", str(patch))
-        git("add", "-A")
-        git("commit", "-m",
+
+        self_mod._git("checkout", "-b", branch, base_dir=base)
+        self_mod._git("apply", *flags, str(patch), base_dir=base)
+        # Scoped to exactly the diff's files — NOT `add -A`, which would also
+        # stage unrelated working-tree side effects (audit log, other pending
+        # records) and make it impossible to cleanly return to `start` after.
+        self_mod._git("add", "--", *self_mod._diff_paths(diff), base_dir=base)
+        self_mod._git("commit", "-m",
             f"core-safety: approved change {rec['diff_hash']}\n\n"
-            f"Approved by {rec['approved_by']}. Rollback: git revert this commit.")
+            f"Approved by {rec['approved_by']}. Rollback: git revert this commit.",
+            base_dir=base)
+
+        touched = [p for p in self_mod._diff_paths(diff) if self_mod._is_protected(p)]
+        rec["applied_content_hash"] = self_mod.protected_content_hash(touched, base_dir=base)
+
         self_mod.log_change({
             "event": "core_safety_applied", "pending_id": rec["id"],
             "approved_by": rec["approved_by"], "branch": branch,
             "risk_level": "core_safety_change", "applied": True,
+            "applied_content_hash": rec["applied_content_hash"],
         })
         return True
     finally:
         patch.unlink(missing_ok=True)
+        self_mod._git("checkout", start, base_dir=base)   # never leave HEAD on the new branch
 
 
 def reject_change(pending_id: str, reason: str, rejected_by: str) -> str:

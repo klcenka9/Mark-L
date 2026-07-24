@@ -527,15 +527,21 @@ TOOL_DECLARATIONS = [
             "upgrade itself or one of its modules. "
             "Use action='pending' when the user asks what changes await approval. "
             "Use action='audit' for the recent self-modification history. "
+            "Use action='add_skill' when the user asks JARVIS to add a brand-new "
+            "capability/tool — requires name, description, and code (a Python file "
+            "defining run(parameters, **kwargs)); it starts YELLOW and must earn GREEN. "
             "SAFE changes are applied automatically; DANGEROUS changes always wait "
             "for the user's explicit approval and are never applied silently."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "run | status | pending | audit"},
+                "action":      {"type": "STRING", "description": "run | status | pending | audit | add_skill"},
                 "target":      {"type": "STRING", "description": "Optional module to focus on, e.g. 'web_search'"},
                 "instruction": {"type": "STRING", "description": "Optional user instruction, e.g. 'add a retry to web search'"},
+                "name":        {"type": "STRING", "description": "add_skill: lowercase snake_case name for the new skill"},
+                "description": {"type": "STRING", "description": "add_skill: what the new skill does (used as its tool description)"},
+                "code":        {"type": "STRING", "description": "add_skill: full Python source defining run(parameters, **kwargs)"},
             },
             "required": ["action"],
         },

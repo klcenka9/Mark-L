@@ -12,7 +12,9 @@ and queues DANGEROUS / CORE-SAFETY diffs for human review. Hard limits keep
 the loop bounded — see RUN LIMITS below.
 """
 
+import ast
 import json
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -197,10 +199,61 @@ def auto_trigger_check(model=None) -> str | None:
     return run_self_improve(target=None, model=model)
 
 
+def add_skill(name: str, description: str, code: str, model=None) -> str:
+    """Create a brand-new action module and register it as a tool.
+
+    The new file goes through the SAME safety pipeline as any other change
+    (classify_change, git branch, tests before/after, quality check,
+    auto-revert on regression) — creating a file that doesn't touch a
+    protected/dangerous path or dangerous content classifies as SAFE and
+    applies immediately; anything else is queued for human review like any
+    other diff. Only on a successful SAFE apply is the action wired into
+    the tool registry, and it starts YELLOW — it must earn GREEN through
+    error-free calls, same as if a human had added it by hand.
+
+    Convention: `code` must define `run(parameters: dict, **kwargs)`.
+    """
+    from actions import registry
+
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", name):
+        return f"Invalid skill name '{name}' — use lowercase snake_case."
+    try:
+        ast.parse(code)
+    except SyntaxError as e:
+        return f"Skill code does not parse: {e}"
+    if "def run(" not in code:
+        return "Skill code must define a function named run(parameters, **kwargs)."
+
+    path = f"actions/{name}.py"
+    if (self_mod.BASE_DIR / path).exists():
+        return f"'{path}' already exists — choose a different name."
+
+    diff = self_mod.make_create_file_diff(path, code)
+    risk = self_mod.classify_change(diff)
+    if risk != "safe":
+        pending_id = self_mod.queue_pending_change({
+            "diff": diff, "risk_level": risk,
+            "rationale": f"New skill '{name}': {description}",
+            "expected_effect": f"Adds a '{name}' tool once approved.",
+            "rollback_plan": "git revert the applying commit.",
+        })
+        return (f"New skill '{name}' classified as {risk} — queued for your "
+                f"review: {pending_id}")
+
+    if not self_mod.apply_diff(diff, "safe"):
+        return f"Could not create '{path}' — the file failed to apply cleanly or regressed tests."
+
+    declaration = {
+        "name": name, "description": description,
+        "parameters": {"type": "OBJECT", "properties": {}},
+    }
+    return registry.register_action(name, f"actions.{name}", "run", declaration)
+
+
 # ── Tool entry point (called from main.py) ───────────────────────────────────
 
 def self_improve(parameters: dict, player=None, speak=None, **_) -> str:
-    """Voice/UI tool: action = run | status | pending | audit."""
+    """Voice/UI tool: action = run | status | pending | audit | add_skill."""
     p      = parameters or {}
     action = (p.get("action") or "status").strip().lower()
 
@@ -215,6 +268,14 @@ def self_improve(parameters: dict, player=None, speak=None, **_) -> str:
             instruction=p.get("instruction") or None,
             log=log,
         )
+
+    if action == "add_skill":
+        name        = (p.get("name") or "").strip().lower()
+        description = (p.get("description") or "").strip()
+        code        = p.get("code") or ""
+        if not (name and description and code):
+            return "add_skill needs 'name', 'description', and 'code'."
+        return add_skill(name, description, code)
 
     if action == "pending":
         records = self_mod.list_pending()
