@@ -107,12 +107,11 @@ See [`docs/SELF_IMPROVE.md`](docs/SELF_IMPROVE.md) for the full design.
 
 ## ⚡ Quick Start
 
-This fork includes the **SELF_IMPROVE** layer on top of upstream Mark L. Until it's merged into `main`, check out its branch after cloning:
+This fork includes the **SELF_IMPROVE** layer on top of upstream Mark L, already on the `main` branch:
 
 ```bash
 git clone https://github.com/klcenka9/Mark-L.git
 cd Mark-L
-git checkout claude/jarvis-self-improve-layer-x71loc
 python setup.py
 python main.py
 ```
@@ -138,7 +137,6 @@ On first launch you'll be asked for your Gemini API key, assistant name, and you
    ```powershell
    git clone https://github.com/klcenka9/Mark-L.git
    cd Mark-L
-   git checkout claude/jarvis-self-improve-layer-x71loc
    python -m venv venv
    venv\Scripts\activate
    python setup.py
