@@ -151,6 +151,110 @@ def test_read_file_refuses_escape():
         self_mod.read_file("../../etc/passwd")
 
 
+# ── proposal parsing (robust to real model output) ───────────────────────────
+
+def test_parse_proposal_fenced_blocks_with_quotes():
+    """A diff full of quotes survives because it lives in its own fence,
+    not inside a JSON string (the bug a real Gemini run exposed)."""
+    text = (
+        "Here you go:\n"
+        "```json\n"
+        '{"rationale": "add docstring", "expected_effect": "clearer",'
+        ' "risk_level": "safe", "rollback_plan": "git revert", "tests_to_run": []}\n'
+        "```\n"
+        "```diff\n"
+        "--- a/actions/x.py\n"
+        "+++ b/actions/x.py\n"
+        "@@ -1,1 +1,2 @@\n"
+        ' import os\n'
+        '+x = """triple quoted "" value"""\n'
+        "```\n"
+    )
+    p = self_mod._parse_proposal(text)
+    assert p["rationale"] == "add docstring"
+    assert '"""triple quoted' in p["diff"]        # quotes preserved verbatim
+    assert p["diff"].startswith("--- a/actions/x.py")
+
+
+def test_parse_proposal_json_fallback():
+    """Older single-JSON-object answers with an embedded diff still parse."""
+    text = json.dumps({
+        "diff": "--- a/actions/x.py\n+++ b/actions/x.py\n@@ -1 +1,2 @@\n a\n+b\n",
+        "rationale": "r", "expected_effect": "e",
+        "risk_level": "safe", "rollback_plan": "revert",
+    })
+    p = self_mod._parse_proposal(text)
+    assert "actions/x.py" in p["diff"]
+    assert p["rationale"] == "r"
+
+
+def test_parse_proposal_no_diff_raises():
+    with pytest.raises(ValueError):
+        self_mod._parse_proposal("```json\n{\"rationale\": \"x\"}\n```")
+
+
+def test_apply_tolerates_wrong_hunk_counts_and_crlf(tmp_path, monkeypatch):
+    """A model diff with wrong @@ counts against a CRLF file still applies
+    (via the --recount / --ignore-whitespace fallback strategies)."""
+    import subprocess
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "actions").mkdir()
+    # CRLF file, like this repo's sources.
+    (repo / "actions" / "x.py").write_bytes(b"import os\r\nprint(1)\r\n")
+    for cmd in (["git", "init", "-q"], ["git", "config", "user.email", "t@t"],
+                ["git", "config", "user.name", "t"], ["git", "add", "-A"],
+                ["git", "commit", "-qm", "init"]):
+        subprocess.run(cmd, cwd=repo, check=True)
+    monkeypatch.setattr(self_mod, "BASE_DIR", repo)
+    monkeypatch.setattr(self_mod, "PENDING_DIR", repo / "pending_changes")
+    monkeypatch.setattr(self_mod, "AUDIT_LOG_PATH", repo / "logs" / "audit.jsonl")
+    monkeypatch.setattr(self_mod, "STATUS_PATH", repo / "status.json")
+    monkeypatch.setattr(self_mod, "run_tests", lambda scope=None: {"passed": True, "runner": "stub"})
+
+    # LF diff, deliberately wrong count (@@ -1,1 should be -1,2), targeting CRLF file.
+    diff = (
+        "--- a/actions/x.py\n"
+        "+++ b/actions/x.py\n"
+        "@@ -1,1 +1,3 @@\n"
+        " import os\n"
+        "+import sys\n"
+        " print(1)\n"
+    )
+    assert self_mod.apply_diff(diff, "safe") is True
+    assert b"import sys" in (repo / "actions" / "x.py").read_bytes()
+
+
+def test_safe_change_degrading_quality_is_auto_reverted(tmp_path, monkeypatch):
+    """A 'safe', tests-green change that silently degrades code (module loses
+    its docstring) is caught by the quality gate and reverted."""
+    import subprocess
+    repo = tmp_path / "repo"
+    (repo / "actions").mkdir(parents=True)
+    (repo / "actions" / "y.py").write_text('"""Module doc."""\nimport os\n', encoding="utf-8")
+    for cmd in (["git", "init", "-q"], ["git", "config", "user.email", "t@t"],
+                ["git", "config", "user.name", "t"], ["git", "add", "-A"],
+                ["git", "commit", "-qm", "init"]):
+        subprocess.run(cmd, cwd=repo, check=True)
+    monkeypatch.setattr(self_mod, "BASE_DIR", repo)
+    monkeypatch.setattr(self_mod, "PENDING_DIR", repo / "pending_changes")
+    monkeypatch.setattr(self_mod, "AUDIT_LOG_PATH", repo / "logs" / "audit.jsonl")
+    monkeypatch.setattr(self_mod, "STATUS_PATH", repo / "status.json")
+    monkeypatch.setattr(self_mod, "run_tests", lambda scope=None: {"passed": True, "runner": "stub"})
+
+    # Moves the module docstring below the import → module loses __doc__.
+    diff = (
+        "--- a/actions/y.py\n"
+        "+++ b/actions/y.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        '-"""Module doc."""\n'
+        " import os\n"
+        '+"""Module doc."""\n'
+    )
+    assert self_mod.apply_diff(diff, "safe") is False           # reverted
+    assert (repo / "actions" / "y.py").read_text().startswith('"""Module doc."""')
+
+
 # ── review gate (shared backend of CLI and UI dialogs) ───────────────────────
 
 import subprocess
