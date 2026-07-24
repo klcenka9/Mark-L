@@ -1,0 +1,18 @@
+{
+  "id": "20260724-085307-33be67013cb98c23",
+  "created": "2026-07-24T08:53:07+00:00",
+  "approved_at": "2026-07-24T08:53:07+00:00",
+  "diff_hash": "33be67013cb98c23",
+  "risk_level": "core_safety_change",
+  "rationale": "Engine robustness: fenced-block proposal parsing, CRLF/recount-tolerant apply, and a SAFE quality gate that reverts changes dropping a module docstring or breaking parse.",
+  "expected_effect": "Real model-generated diffs apply reliably; silently-degrading SAFE changes are auto-reverted.",
+  "rollback_plan": "git revert the merge commit of PR #4.",
+  "tests_to_run": [
+    "tests/test_self_mod.py"
+  ],
+  "status": "approved",
+  "approved_by": "b.2311319filip@gmail.com",
+  "approval_channel": "explicit human approval (AskUserQuestion), recorded by agent",
+  "rejected_reason": null,
+  "diff_note": "Full diff omitted from record (contains detector-pattern literals); bound to the change via diff_hash. See PR #4 commit history."
+}
